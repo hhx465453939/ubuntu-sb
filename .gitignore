@@ -1,0 +1,63 @@
+# ============================================
+# ubuntu傻逼 - .gitignore
+# ============================================
+# 注意: cache/ 目录是 MCP 工具链的本地缓存，
+# 和其他项目无关，在这里忽略掉。
+
+# ---- 本地缓存（第三方工具写入，不应进仓库）----
+cache/
+
+# ---- 系统临时文件 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.dll
+*.exe
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+.DS_Store
+Thumbs.db
+
+# ---- 操作系统 ----
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- 日志和临时文件 ----
+*.log
+*.tmp
+*.temp
+
+# ---- Python 虚拟环境 ----
+venv/
+.venv/
+env/
+.env/
+
+# ---- Conda ----
+.conda/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---- 压缩包 ----
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.zip
+*.7z
+*.rar
+
+# ---- PDF（积累太多会爆仓库）----
+*.pdf
+
+# ---- 大文件警告 ----
+# 如果你有超过 10MB 的日志或截图，请放到别处

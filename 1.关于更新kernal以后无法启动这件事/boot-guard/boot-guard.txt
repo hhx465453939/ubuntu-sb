@@ -1,0 +1,399 @@
+#!/bin/bash
+# ============================================================================
+# boot-guard — Ubuntu 内核更新启动保护套件 v1.0
+# ============================================================================
+# 设计目标：解决 Ubuntu 内核更新后因 initramfs 缺少存储驱动 / fstab 配置
+# 问题导致 emergency mode 的顽疾。提供 4 层防护：
+#
+#   第 1 层 — 内核安装前检查 (preinst hook)
+#   第 2 层 — 内核安装后验证 initramfs 完整性 (postinst hook)
+#   第 3 层 — 启动成功标记，自动记录可用内核 (systemd service)
+#   第 4 层 — GRUB 回退配置，启动失败可选手动选择旧内核
+#
+# 用法：
+#   boot-guard check                    全面诊断所有内核和系统配置
+#   boot-guard harden                   一次性系统加固（fstab/GRUB/hooks/service）
+#   boot-guard validate-kernel <版本>   验证指定内核的 initramfs 是否包含必要驱动
+#   boot-guard mark-boot-ok             标记当前启动成功（由 systemd 服务自动调用）
+# ============================================================================
+
+set -e
+
+# ---- 配置常量 ----
+LOG_FILE="/var/log/boot-guard.log"
+STATE_DIR="/var/lib/boot-guard"
+GRUB_CFG="/etc/default/grub"
+MIN_BOOT_MB=50
+MIN_ROOT_MB=500
+
+# ---- 颜色 ----
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ---- 日志 ----
+log()    { echo -e "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+log_ok() { log "${GREEN}[✓]${NC} $1"; }
+log_warn(){ log "${YELLOW}[!]${NC} $1"; }
+log_err(){ log "${RED}[✗]${NC} $1"; }
+log_hdr(){ log ""; log "${BLUE}── $1 ──${NC}"; }
+
+# ---- 检测存储控制器类型 ----
+detect_storage() {
+    for d in /sys/block/sd* /sys/block/nvme* /sys/block/vd*; do
+        [ -e "$d" ] || continue
+        case "$(basename "$d")" in
+            nvme*) echo "nvme"; return ;;
+            vd*)   echo "virtio"; return ;;
+            sd*)   echo "sata"; return ;;
+        esac
+    done
+    echo "sata"  # 兜底
+}
+
+# ========================================================================
+# 核心功能：验证 initramfs 包含必要的存储驱动
+# 这是整个方案最关键的一步 — Ubuntu 的 update-initramfs 跑完从不验证
+# ========================================================================
+validate_initramfs() {
+    local kver="$1"
+    local initrd="/boot/initrd.img-${kver}"
+    local errors=0
+
+    if [ ! -f "$initrd" ]; then
+        log_err "initrd 不存在: $initrd"
+        return 1
+    fi
+
+    local stype=$(detect_storage)
+    log_hdr "验证内核 $kver (磁盘: $stype)"
+
+    # 按存储类型定义必须存在的内核模块
+    local must=()
+    case "$stype" in
+        sata)   must=(ahci ata_piix sd_mod libata scsi_mod) ;;
+        nvme)   must=(nvme nvme_core sd_mod) ;;
+        virtio) must=(virtio_blk virtio_pci sd_mod) ;;
+        *)      must=(ahci sd_mod scsi_mod libata) ;;
+    esac
+
+    # 获取 initramfs 内所有模块列表
+    local modlist
+    modlist=$(lsinitramfs "$initrd" 2>/dev/null | grep '\.ko$' | sed 's|.*/||; s|\.ko.*||' | sort -u)
+
+    if [ -z "$modlist" ]; then
+        log_err "无法解析 initramfs (可能损坏)"
+        return 1
+    fi
+
+    local total_mods=$(echo "$modlist" | wc -l)
+    log "  包含 $total_mods 个内核模块"
+
+    # 逐个检查必须模块
+    local builtin_file="/lib/modules/${kver}/modules.builtin"
+    for m in "${must[@]}"; do
+        if echo "$modlist" | grep -qxF "$m"; then
+            log_ok "  $m"
+        elif [ -f "$builtin_file" ] && grep -qE "/${m}\.ko$" "$builtin_file" 2>/dev/null; then
+            log "  ${m} (built-in) — 已编译进内核"
+        else
+            log_err "  $m ← 缺失！内核将无法挂载根文件系统！"
+            errors=$((errors + 1))
+        fi
+    done
+
+    # 检查文件系统模块
+    for m in ext4 vfat; do
+        if echo "$modlist" | grep -qxF "$m"; then
+            log_ok "  $m (fs)"
+        else
+            log "  ${YELLOW}  $m (fs)${NC} — 可能编译进内核"
+        fi
+    done
+
+    # 大小检查
+    local sz=$(( $(stat -c%s "$initrd" 2>/dev/null || echo 0) / 1024 ))
+    if [ "$sz" -lt 5000 ]; then
+        log_warn "initrd 大小仅 ${sz}KB，可能不完整！"
+        errors=$((errors + 1))
+    else
+        log "  initrd 大小: ${sz}KB"
+    fi
+
+    if [ "$errors" -gt 0 ]; then
+        log_err "结果: 验证失败 ($errors 个致命问题)"
+        log_err "修复: chroot 后运行 update-initramfs -u -k $kver"
+        return 1
+    else
+        log_ok "结果: 验证通过 ✓"
+        return 0
+    fi
+}
+
+# ========================================================================
+# fstab 安全性检查
+# ========================================================================
+check_fstab() {
+    local f="${1:-/etc/fstab}"
+    local errors=0
+
+    [ ! -f "$f" ] && { log_err "fstab 不存在: $f"; return 1; }
+    log_hdr "fstab 检查"
+
+    local n=0
+    while IFS= read -r line; do
+        n=$((n + 1))
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        local mp=$(echo "$line" | awk '{print $2}')
+        local ops=$(echo "$line" | awk '{print $4}')
+        local tp=$(echo "$line" | awk '{print $3}')
+
+        # 这些必须成功挂载，不加 nofail
+        [[ "$mp" =~ ^/$ || "$mp" =~ ^/boot$ || "$mp" =~ ^/boot/efi$ ]] && continue
+        [[ "$tp" == "swap" || "$mp" == "none" ]] && continue
+        [[ "$mp" =~ ^/var$|^/usr$|^/tmp$ ]] && continue
+
+        if ! echo "$ops" | grep -q 'nofail'; then
+            log_err "  行$n: $mp ($tp) 缺少 nofail"
+            errors=$((errors + 1))
+        fi
+    done < "$f"
+
+    [ "$errors" -eq 0 ] && log_ok "所有非关键挂载均有 nofail" || log_err "共 $errors 条缺少 nofail"
+    return $errors
+}
+
+# ========================================================================
+# 磁盘空间检查
+# ========================================================================
+check_disk() {
+    log_hdr "磁盘空间"
+    local errors=0
+    for mp in /boot /; do
+        local free=$(df -m "$mp" 2>/dev/null | awk 'NR==2{print $4}')
+        local min=$([ "$mp" = "/boot" ] && echo $MIN_BOOT_MB || echo $MIN_ROOT_MB)
+        if [ "$free" -lt "$min" ]; then
+            log_err "$mp: ${free}MB (需 ≥${min}MB)"
+            errors=$((errors + 1))
+        else
+            log_ok "$mp: ${free}MB 可用"
+        fi
+    done
+    return $errors
+}
+
+# ========================================================================
+# GRUB 配置检查
+# ========================================================================
+check_grub() {
+    log_hdr "GRUB 配置"
+    local errors=0
+
+    if [ -f "$GRUB_CFG" ]; then
+        grep -q 'GRUB_TIMEOUT=0' "$GRUB_CFG" && { log_warn "GRUB_TIMEOUT=0，无法选择内核"; errors=$((errors+1)); }
+    fi
+
+    local cnt=$(ls /boot/vmlinuz-* 2>/dev/null | wc -l)
+    [ "$cnt" -ge 2 ] && log_ok "$cnt 个内核可用" || { log_warn "仅 $cnt 个内核，无回退"; errors=$((errors+1)); }
+    return $errors
+}
+
+# ========================================================================
+# 标记启动成功
+# ========================================================================
+mark_boot_ok() {
+    mkdir -p "$STATE_DIR"
+    local cur=$(uname -r)
+    local prev=""
+    [ -f "$STATE_DIR/last-boot" ] && prev=$(head -1 "$STATE_DIR/last-boot")
+
+    echo "$cur" > "$STATE_DIR/last-boot"
+    date '+%Y-%m-%d %H:%M:%S' >> "$STATE_DIR/last-boot"
+    echo "status: ok" >> "$STATE_DIR/last-boot"
+    date '+%s' > "$STATE_DIR/last-boot-ok"
+
+    if [ -n "$prev" ] && [ "$cur" != "$prev" ]; then
+        echo "$prev" > "$STATE_DIR/last-good-kernel"
+        log_ok "新内核 $cur 首次启动成功 (上次: $prev)"
+    else
+        log_ok "启动成功: $cur"
+    fi
+}
+
+# ========================================================================
+# 一键加固
+# ========================================================================
+do_harden() {
+    echo ""
+    echo "╔══════════════════════════════════════╗"
+    echo "║   Boot Guard 系统加固 v1.0          ║"
+    echo "╚══════════════════════════════════════╝"
+    echo ""
+
+    # 1. fstab nofail
+    log_hdr "[1/5] fstab 加固"
+    cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d%H%M)
+    sed -i -E '/^\s*UUID=/{ /\/\s|\/boot\/efi|\/boot\s|swap|nofail/! s/(defaults)/\1,nofail/ }' /etc/fstab
+    sed -i -E '/^\s*UUID=/{ /\/\s|\/boot\/efi|\/boot\s|swap|nofail/! s/(defaults,[^ ]*)/\1,nofail/ }' /etc/fstab
+    log_ok "fstab 已加固（备份: /etc/fstab.bak.*）"
+
+    # 2. GRUB 回退
+    log_hdr "[2/5] GRUB 回退配置"
+    cp "$GRUB_CFG" "${GRUB_CFG}.bak.$(date +%Y%m%d%H%M)"
+    sed -i 's/^GRUB_TIMEOUT=0/GRUB_TIMEOUT=3/' "$GRUB_CFG"
+    grep -q '^GRUB_TIMEOUT=' "$GRUB_CFG" || echo 'GRUB_TIMEOUT=3' >> "$GRUB_CFG"
+    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' "$GRUB_CFG"
+    grep -q '^GRUB_SAVEDEFAULT=' "$GRUB_CFG" || echo 'GRUB_SAVEDEFAULT=true' >> "$GRUB_CFG"
+    sed -i 's/^GRUB_TIMEOUT_STYLE=hidden/GRUB_TIMEOUT_STYLE=menu/' "$GRUB_CFG"
+    update-grub 2>&1 | tail -1
+    log_ok "GRUB 已配置 (超时 3s, 记住上次选择)"
+
+    # 3. 内核钩子
+    log_hdr "[3/5] 内核钩子"
+    cat > /tmp/bg-preinst << 'X'
+#!/bin/bash
+echo "[boot-guard] $(date) pre: $1" >> /var/log/boot-guard.log
+/usr/local/sbin/boot-guard check-pre 2>&1 | tee -a /var/log/boot-guard.log
+exit 0
+X
+    cat > /tmp/bg-postinst << 'X'
+#!/bin/bash
+K="${1:-unknown}"
+echo "[boot-guard] $(date) post: $K" >> /var/log/boot-guard.log
+sleep 2
+/usr/local/sbin/boot-guard validate-kernel "$K" 2>&1 | tee -a /var/log/boot-guard.log
+R=$?
+if [ $R -ne 0 ]; then
+    echo "" >> /var/log/boot-guard.log
+    echo "============================================" >> /var/log/boot-guard.log
+    echo " ⚠️  $K initramfs 验证失败！勿重启！" >> /var/log/boot-guard.log
+    echo "    sudo boot-guard check" >> /var/log/boot-guard.log
+    echo "============================================" >> /var/log/boot-guard.log
+fi
+exit 0
+X
+    sudo cp /tmp/bg-preinst /etc/kernel/preinst.d/boot-guard
+    sudo cp /tmp/bg-postinst /etc/kernel/postinst.d/zzz-boot-guard
+    sudo chmod 755 /etc/kernel/preinst.d/boot-guard /etc/kernel/postinst.d/zzz-boot-guard
+    rm /tmp/bg-preinst /tmp/bg-postinst
+    log_ok "钩子已安装 (preinst.d + postinst.d)"
+
+    # 4. systemd 启动标记
+    log_hdr "[4/5] 启动成功标记服务"
+    cat > /tmp/bg-service << 'X'
+[Unit]
+Description=Boot Guard - Mark boot success
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/sbin/boot-guard mark-boot-ok
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+X
+    sudo cp /tmp/bg-service /etc/systemd/system/boot-guard-success.service
+    rm /tmp/bg-service
+    sudo systemctl daemon-reload
+    sudo systemctl enable boot-guard-success.service 2>/dev/null || true
+    log_ok "服务已启用"
+
+    # 5. 日志轮转
+    log_hdr "[5/5] 日志轮转"
+    cat > /tmp/bg-logrotate << 'X'
+/var/log/boot-guard.log {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    create 644 root root
+}
+X
+    sudo cp /tmp/bg-logrotate /etc/logrotate.d/boot-guard
+    rm /tmp/bg-logrotate
+    sudo mkdir -p "$STATE_DIR"
+    log_ok "日志轮转已配置"
+
+    echo ""
+    echo "╔══════════════════════════════════════╗"
+    echo "║   ✅ 加固完成                       ║"
+    echo "╚══════════════════════════════════════╝"
+    echo ""
+    echo "  已激活的防护层:"
+    echo "  1. fstab nofail — 外部磁盘缺失不会触发 emergency mode"
+    echo "  2. GRUB 回退   — 启动时可选旧内核, 记住成功启动的内核"
+    echo "  3. 内核钩子    — 每次 apt 装内核自动验证 initramfs"
+    echo "  4. 启动标记    — 自动记录可用内核便于回退"
+    echo ""
+    echo "  下一步: sudo boot-guard check"
+    echo ""
+}
+
+# ========================================================================
+# 全面诊断
+# ========================================================================
+do_check() {
+    echo ""
+    echo "╔══════════════════════════════════════╗"
+    echo "║   Boot Guard 全面诊断               ║"
+    echo "╠══════════════════════════════════════╣"
+    echo "║   时间: $(date '+%Y-%m-%d %H:%M')"
+    echo "║   内核: $(uname -r 2>/dev/null || echo 'chroot')"
+    echo "╚══════════════════════════════════════╝"
+
+    local total=0
+    check_fstab || total=$((total+1))
+    check_disk || total=$((total+1))
+    check_grub || total=$((total+1))
+
+    for v in /boot/vmlinuz-*; do
+        [ -f "$v" ] || continue
+        validate_initramfs "${v#/boot/vmlinuz-}" || total=$((total+1))
+    done
+
+    echo ""
+    if [ "$total" -eq 0 ]; then
+        log_ok "╔══════════════════════════════════════╗"
+        log_ok "║   ✅ 一切正常，可以安全重启         ║"
+        log_ok "╚══════════════════════════════════════╝"
+    else
+        log_warn "╔══════════════════════════════════════╗"
+        log_warn "║   ⚠️  发现 $total 个问题，请在重启前修复  ║"
+        log_warn "╚══════════════════════════════════════╝"
+    fi
+}
+
+# ========================================================================
+# 主入口
+# ========================================================================
+case "${1:-}" in
+    check)
+        do_check ;;
+    harden)
+        do_harden ;;
+    validate-kernel)
+        [ -z "${2:-}" ] && { echo "用法: $0 validate-kernel <版本>"; exit 1; }
+        validate_initramfs "$2" ;;
+    check-pre)
+        check_fstab || true
+        check_disk || true ;;
+    mark-boot-ok)
+        mark_boot_ok ;;
+    *)
+        echo "boot-guard v1.0 — Ubuntu 内核更新启动保护"
+        echo ""
+        echo "用法: boot-guard <命令>"
+        echo ""
+        echo "  check                    全面诊断"
+        echo "  harden                   一键加固"
+        echo "  validate-kernel <版本>   验证 initramfs"
+        echo "  mark-boot-ok             标记启动成功"
+        exit 1 ;;
+esac
