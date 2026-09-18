@@ -1,0 +1,8 @@
+[Unit]
+Description=selfheal GRUB/MBR 备份调度（每月 1 日 12 点）
+[Timer]
+OnCalendar=monthly
+Persistent=true
+Unit=selfheal-grub-backup.service
+[Install]
+WantedBy=timers.target

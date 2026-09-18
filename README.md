@@ -30,6 +30,9 @@ ubuntu-sb/
 ├── 1.关于更新kernal以后无法启动这件事/   # 更个内核，机器直接进 emergency mode
 │   ├── ubuntu-kernel-boot-fix-diagnosis.md  # 7 种死法 + 自动修复脚本
 │   └── boot-guard/                    # Boot Guard 给你锁了 BIOS，爽不爽？
+├── 2.关于内存卡死到引导都碎了这件事/     # 内存耗尽假死，硬重启把 GRUB 干碎
+│   ├── 内存耗尽假死与开机自愈系统.md    # 深夜 Ventoy 抢救实录 + 8 个真坑
+│   └── selfheal/                      # 防/守/修/救 四层开机自愈系统（压力哨兵+看门狗+fsck+MBR备份）
 └── 更多坑，施工中……
 ```
 
@@ -41,6 +44,7 @@ ubuntu-sb/
 |---|--------|-----------|-----------|
 | 0 | **在 Ubuntu 24.04 上装 Node.js** | ？ | `apt install nodejs` 装完发现是 12.x，或者装了 snap 版结果 `node` 指令都不认。赛亚人来了都得掉层皮，所以我写了个一键脚本续命 |
 | 1 | **内核更新后启动不了** | 10年+ | 更新个 kernel，重启直接 emergency mode。fstab 没 `nofail`、initramfs 没重建、GRUB 写错位置、NVIDIA 驱动炸了……七种死法，总有一款适合你 |
+| 2 | **内存耗尽假死 → 引导碎裂** | 30年+（OOM 这词儿 Unix 时代就有）| swap 给小了，oomd 保镖先晕倒了，系统抽搐半小时后假死；硬重启把 GRUB 干碎，深夜 Ventoy 抢救。事后装了套「防/守/修/救」自愈系统：压力哨兵 + 看门狗 + 开机 fsck + MBR 每月备份 + U盘一键救援 |
 
 ---
 
@@ -48,7 +52,7 @@ ubuntu-sb/
 
 | 指标 | 数值 |
 |------|------|
-| 已记录坑数 | 2 |
+| 已记录坑数 | 3 |
 | 其中 Launchpad 有 Bug Report 但十年未修的 | 猜猜看 |
 | Ubuntu 官方镜像下一个版本能修好几个 | 我赌 0 个 |
 | 这个仓库还要更新多久 | ∞ |

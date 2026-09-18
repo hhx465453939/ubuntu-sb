@@ -1,0 +1,8 @@
+[Unit]
+Description=selfheal 开机守卫（判定上次死法 / fsck 结果留痕 / 熔断器）
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/selfheal.sh boot-guard
+[Install]
+WantedBy=multi-user.target

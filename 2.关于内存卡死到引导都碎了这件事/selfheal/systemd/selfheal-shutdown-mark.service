@@ -1,0 +1,9 @@
+[Unit]
+Description=selfheal 正常关机标记（ExecStop 在关机流程落盘留痕）
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/selfheal.sh shutdown-mark
+[Install]
+WantedBy=multi-user.target

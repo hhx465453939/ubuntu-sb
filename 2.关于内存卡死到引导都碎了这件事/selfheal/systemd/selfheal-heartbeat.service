@@ -1,0 +1,5 @@
+[Unit]
+Description=selfheal 心跳+内存压力巡检（每分钟）
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/selfheal.sh patrol
