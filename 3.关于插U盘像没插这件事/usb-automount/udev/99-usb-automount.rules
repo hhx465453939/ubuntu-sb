@@ -1,0 +1,11 @@
+# 99-usb-automount.rules —— USB/SD 移动存储自动挂载触发规则
+# 原理：设备插入 → 本规则触发 systemd 模板服务 usb-automount@<设备名>.service
+#       （分区会由 udev 内置的 IMPORT{parent} 继承父盘的 ID_BUS，故分区同样命中）
+# 卸载：设备拔出时 systemd 因 BindsTo=dev-xxx.device 自动停服 → ExecStop 清理挂载点
+
+# USB 总线（U盘 / USB移动硬盘 / USB读卡器），分区或免分区整盘均覆盖
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-automount@$name.service"
+
+# SD 卡（mmc 总线）。加可移除性过滤：内置 eMMC 的 removable=0 不命中，
+# 防止把内置存储分区挂进 /media/usb/（主脚本另有 mmc 可移除性纵深防御）
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="mmcblk*", ATTRS{removable}=="1", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-automount@$name.service"

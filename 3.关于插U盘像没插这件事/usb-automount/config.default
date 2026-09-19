@@ -1,0 +1,16 @@
+# /etc/default/usb-automount —— usb-automount 配置
+# 改完立即生效（主脚本每次执行都会重新读取），无需重启任何服务。
+# 仅当改动 udev 规则时才需要: sudo udevadm control --reload
+
+# 挂载根路径（独立的专用路径，cd 可进、df -h 可见）
+MOUNT_BASE="/media/usb"
+
+# 挂载后文件归属用户（由 install 脚本按实际部署用户写入）
+MOUNT_OWNER="@MOUNT_OWNER@"
+MOUNT_GROUP="@MOUNT_GROUP@"
+
+# FAT/exFAT/NTFS 的 umask（022 = 属主可写，其他人只读）
+UMASK_OPT="022"
+
+# 桌面环境抢先挂载时，是否在 MOUNT_BASE 下建软链兜底：1=建 0=不建
+SYMLINK_FALLBACK=1

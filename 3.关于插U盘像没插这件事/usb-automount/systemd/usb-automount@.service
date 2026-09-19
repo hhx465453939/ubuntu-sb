@@ -1,0 +1,12 @@
+[Unit]
+Description=usb-automount: 自动挂载 %i
+ConditionFileIsExecutable=/usr/local/bin/usb-automount
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/usb-automount add %i
+ExecStop=/usr/local/bin/usb-automount remove %i
